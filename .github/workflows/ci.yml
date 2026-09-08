@@ -356,6 +356,12 @@ jobs:
       - name: Repo-profile script golden test (show/detect, TODO-fallback contract)
         run: ./tests/repo-profile/test.sh
 
+      # The consumer of the Tracker line the step above writes: forge.sh resolves which forge a
+      # repository lives on and normalises both CLIs behind one vocabulary (#1). Its refusal path
+      # is the point — UNKNOWN_FORGE rather than a guess, because a wrong arm routes real writes.
+      - name: Forge dispatcher golden test (arm resolution, kind/slug/auth, both arms stubbed)
+        run: ./tests/forge/test.sh
+
       # The other half of the same story: repo-profile READS a repo's configuration, repo-setup
       # establishes it (#192). Drives idempotence, the additive/--prune split, never-clobber on an
       # existing issue form, and per-surface degradation — all against a stateful gh stub.

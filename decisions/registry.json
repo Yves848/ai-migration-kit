@@ -36,6 +36,7 @@
     "scripts/decision-check.py": "the guard that enforces this very registry; it cannot audit itself as one of its own subjects",
     "scripts/dependency-health.sh": "a read-only probe of a delivered dependency graph — it runs `dotnet list package --vulnerable/--deprecated` and reports what it found, the same shape as audit-inventory.sh; phase 6's exit gate is what branches on the result",
     "scripts/followups.py": "aggregates follow-ups and applies the owner's stated answers to the reports; it decides nothing itself",
+    "scripts/forge.sh": "a CLI translation layer — it resolves which forge a repository lives on and re-expresses one operation against gh or glab, normalising the response to the kit's own shape; the arm it prints is a DETECTION (the same class as main-worktree.sh resolving a path), not a control-flow choice a caller branches on from a registered verdict vocabulary, and its one refusal (UNKNOWN_FORGE, exit 3) is a question it could not answer rather than an answer it reached",
     "scripts/main-worktree.sh": "resolves a path (the main working tree's root); it answers a question, it does not branch on one",
     "scripts/parse-sweep.sh": "a structural guard (every suite parses under bash 3.2), not a control-flow choice with a verdict vocabulary",
     "scripts/recap-wiring-check.py": "a structural agreement guard (every skill links the shared recap; the hand-off table, the skills and ARCHITECTURE.md's dashed edges name the same pairs); it has no verdict vocabulary of its own to register",
