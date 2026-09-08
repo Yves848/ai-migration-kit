@@ -209,10 +209,10 @@ verb_kind() {
   echo
 }
 
-verb_slug() {
-  [ $# -eq 0 ] || die_usage "slug takes no arguments"
-  local arm path
-  arm=$(arm_or_die)
+# The project identifier for a given arm, without the trailing newline — the form every verb below
+# interpolates into an endpoint. `verb_slug` is the same value with a newline, for humans.
+slug_value() {
+  local arm="$1" path
   path=$(remote_path)
   if [ -z "$path" ]; then
     echo "forge: no origin remote — cannot name the project on '$ROOT'." >&2
@@ -221,13 +221,21 @@ verb_slug() {
   case "$arm" in
     github)
       # owner/repo, exactly as `gh` takes it for --repo.
-      printf '%s\n' "$path" ;;
+      printf '%s' "$path" ;;
     gitlab)
       # The WHOLE path, URL-encoded: GitLab projects nest in subgroups (`group/sub/project`) and
       # `projects/:id` wants that path percent-encoded. A slug that assumed two segments would
       # address the wrong project — or none — on every subgrouped repository.
-      printf '%s\n' "$path" | sed 's#/#%2F#g' ;;
+      printf '%s' "$path" | sed 's#/#%2F#g' ;;
   esac
+}
+
+verb_slug() {
+  [ $# -eq 0 ] || die_usage "slug takes no arguments"
+  local arm
+  arm=$(arm_or_die)
+  slug_value "$arm"
+  echo
 }
 
 verb_auth() {
@@ -267,10 +275,216 @@ verb_auth() {
   esac
 }
 
+# ------------------------------------------------------------------------------- normalisation
+#
+# The two payload shapes, and the ONE shape the skills see. Every disagreement between the forges
+# is spent here and nowhere else — `number`/`iid`, `OPEN`/`opened`, `[{name}]`/`[string]`,
+# `url`/`web_url`, `updatedAt`/`updated_at`. A caller that had to know which spelling it was
+# holding would be a caller that has to know which forge it is on, which is the thing this file
+# exists to abolish.
+NORM_ISSUE_GH='{number:.number,title:.title,body:(.body//""),state:(.state|ascii_downcase),labels:[.labels[]?|.name],url:.url,updatedAt:.updatedAt}'
+NORM_ISSUE_GL='{number:.iid,title:.title,body:(.description//""),state:(if .state=="opened" then "open" else (.state|ascii_downcase) end),labels:(.labels//[]),url:.web_url,updatedAt:.updated_at}'
+
+forge_fail() { printf 'forge: %s\n' "$1" >&2; exit 1; }
+
+# Project the normalised object (or array of them) onto the requested --fields, in the order they
+# were asked for. Empty --fields means "everything the normaliser produces".
+project() {
+  local fields="$1"
+  if [ -z "$fields" ]; then cat; return 0; fi
+  jq --argjson k "$(printf '%s' "$fields" | jq -R 'split(",")')" '
+    def pick($o): reduce $k[] as $x ({}; .[$x] = $o[$x]);
+    if type == "array" then map(. as $o | pick($o)) else . as $o | pick($o) end'
+}
+
+# ------------------------------------------------------------------------------- issue verbs
+
+# Shared option parsing. Every issue verb draws from the same small set, so it is read once rather
+# than six times — a per-verb parser is how `--body-file` ends up meaning something subtly
+# different depending on which verb you reached it through.
+ISSUE_FIELDS=""; ISSUE_STATE=""; ISSUE_SEARCH=""; ISSUE_LIMIT=""
+ISSUE_TITLE=""; ISSUE_BODY_FILE=""; ISSUE_COMMENT=""
+ISSUE_LABELS=""            # comma-joined, for the GitLab REST arm
+GH_LABEL_ARGS=()           # repeated --label, for the gh porcelain arm
+
+parse_issue_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fields)    [ $# -ge 2 ] || die_usage "--fields needs a value";    ISSUE_FIELDS="$2"; shift 2 ;;
+      --state)     [ $# -ge 2 ] || die_usage "--state needs a value";     ISSUE_STATE="$2";  shift 2 ;;
+      --search)    [ $# -ge 2 ] || die_usage "--search needs a value";    ISSUE_SEARCH="$2"; shift 2 ;;
+      --limit)     [ $# -ge 2 ] || die_usage "--limit needs a value";     ISSUE_LIMIT="$2";  shift 2 ;;
+      --title)     [ $# -ge 2 ] || die_usage "--title needs a value";     ISSUE_TITLE="$2";  shift 2 ;;
+      --comment)   [ $# -ge 2 ] || die_usage "--comment needs a value";   ISSUE_COMMENT="$2"; shift 2 ;;
+      --body-file) [ $# -ge 2 ] || die_usage "--body-file needs a value"
+                   [ -r "$2" ] || die_usage "--body-file '$2' is not readable"
+                   ISSUE_BODY_FILE="$2"; shift 2 ;;
+      --label|--add-label)
+                   [ $# -ge 2 ] || die_usage "$1 needs a value"
+                   if [ -z "$ISSUE_LABELS" ]; then ISSUE_LABELS="$2"; else ISSUE_LABELS="$ISSUE_LABELS,$2"; fi
+                   GH_LABEL_ARGS+=("$1" "$2"); shift 2 ;;
+      *) die_usage "unknown option for issue: $1" ;;
+    esac
+  done
+}
+
+# GitLab spells the open state `opened`; the kit says `open`. One translation, one home.
+gl_state() {
+  case "$1" in
+    open)   printf 'opened' ;;
+    closed) printf 'closed' ;;
+    all)    printf 'all' ;;
+    *)      printf '%s' "$1" ;;
+  esac
+}
+
+# Every WRITE goes in as a JSON document on stdin (`--input -`), never as repeated `-f key=value`
+# flags. Two reasons, both load-bearing: `gh -f` and `glab -f` do not agree on type coercion, and
+# an issue body containing newlines — which every body this kit writes does — cannot survive either
+# spelling intact.
+gl_write() {   # gl_write <endpoint> <method> <json-payload>
+  printf '%s' "$3" | glab api "$1" --method "$2" --input -
+}
+
+verb_issue() {
+  local sub="${1:-}"; [ -n "$sub" ] || die_usage "issue needs a sub-verb"
+  shift
+  local num=""
+  case "$sub" in
+    view|edit|comment|reopen)
+      num="${1:-}"
+      case "$num" in ''|*[!0-9]*) die_usage "issue $sub needs an issue number" ;; esac
+      shift ;;
+  esac
+  parse_issue_opts "$@"
+
+  local arm slug raw url payload
+  arm=$(arm_or_die)
+  # `templates` is answered from the working tree, so it needs no project identifier — asking for
+  # one would refuse in a repository whose remote is absent but whose templates are right there.
+  if [ "$sub" != "templates" ]; then slug=$(slug_value "$arm"); fi
+
+  case "$sub" in
+    view)
+      if [ "$arm" = "github" ]; then
+        raw=$(gh issue view "$num" --repo "$slug" \
+              --json number,title,body,state,labels,url,updatedAt) \
+          || forge_fail "gh issue view $num failed"
+        printf '%s' "$raw" | jq "$NORM_ISSUE_GH" | project "$ISSUE_FIELDS"
+      else
+        raw=$(glab api "projects/$slug/issues/$num") \
+          || forge_fail "glab api projects/$slug/issues/$num failed"
+        printf '%s' "$raw" | jq "$NORM_ISSUE_GL" | project "$ISSUE_FIELDS"
+      fi ;;
+
+    list)
+      if [ "$arm" = "github" ]; then
+        set -- issue list --repo "$slug" --json number,title,body,state,labels,url,updatedAt
+        [ -n "$ISSUE_STATE" ]  && set -- "$@" --state "$ISSUE_STATE"
+        [ -n "$ISSUE_SEARCH" ] && set -- "$@" --search "$ISSUE_SEARCH"
+        [ -n "$ISSUE_LIMIT" ]  && set -- "$@" --limit "$ISSUE_LIMIT"
+        set -- "$@" ${GH_LABEL_ARGS[@]+"${GH_LABEL_ARGS[@]}"}
+        raw=$(gh "$@") || forge_fail "gh issue list failed"
+        printf '%s' "$raw" | jq "map($NORM_ISSUE_GH)" | project "$ISSUE_FIELDS"
+      else
+        local q="projects/$slug/issues?per_page=${ISSUE_LIMIT:-100}"
+        [ -n "$ISSUE_STATE" ]  && q="$q&state=$(gl_state "$ISSUE_STATE")"
+        [ -n "$ISSUE_LABELS" ] && q="$q&labels=$ISSUE_LABELS"
+        [ -n "$ISSUE_SEARCH" ] && q="$q&search=$ISSUE_SEARCH"
+        raw=$(glab api "$q") || forge_fail "glab api $q failed"
+        printf '%s' "$raw" | jq "map($NORM_ISSUE_GL)" | project "$ISSUE_FIELDS"
+      fi ;;
+
+    create)
+      [ -n "$ISSUE_TITLE" ] || die_usage "issue create needs --title"
+      [ -n "$ISSUE_BODY_FILE" ] || die_usage "issue create needs --body-file"
+      if [ "$arm" = "github" ]; then
+        url=$(gh issue create --repo "$slug" --title "$ISSUE_TITLE" \
+              --body-file "$ISSUE_BODY_FILE" ${GH_LABEL_ARGS[@]+"${GH_LABEL_ARGS[@]}"}) \
+          || forge_fail "gh issue create failed"
+        jq -n --arg url "$url" '{number: ($url | split("/") | last | tonumber), url: $url}'
+      else
+        payload=$(jq -n --arg t "$ISSUE_TITLE" --rawfile d "$ISSUE_BODY_FILE" --arg l "$ISSUE_LABELS" \
+          '{title:$t, description:$d} + (if $l == "" then {} else {labels:$l} end)')
+        raw=$(gl_write "projects/$slug/issues" POST "$payload") \
+          || forge_fail "glab issue create failed"
+        printf '%s' "$raw" | jq '{number:.iid, url:.web_url}'
+      fi ;;
+
+    edit)
+      if [ "$arm" = "github" ]; then
+        set -- issue edit "$num" --repo "$slug"
+        [ -n "$ISSUE_BODY_FILE" ] && set -- "$@" --body-file "$ISSUE_BODY_FILE"
+        set -- "$@" ${GH_LABEL_ARGS[@]+"${GH_LABEL_ARGS[@]}"}
+        gh "$@" >/dev/null || forge_fail "gh issue edit $num failed"
+      else
+        payload=$(jq -n --arg l "$ISSUE_LABELS" --arg bf "$ISSUE_BODY_FILE" '
+          (if $bf == "" then {} else {description: $bf} end)
+          + (if $l == "" then {} else {add_labels: $l} end)')
+        # The body is read as a raw file rather than interpolated as a path.
+        if [ -n "$ISSUE_BODY_FILE" ]; then
+          payload=$(jq -n --rawfile d "$ISSUE_BODY_FILE" --arg l "$ISSUE_LABELS" \
+            '{description:$d} + (if $l == "" then {} else {add_labels:$l} end)')
+        fi
+        gl_write "projects/$slug/issues/$num" PUT "$payload" >/dev/null \
+          || forge_fail "glab issue edit $num failed"
+      fi
+      jq -n --argjson n "$num" '{number:$n}' ;;
+
+    comment)
+      [ -n "$ISSUE_BODY_FILE" ] || die_usage "issue comment needs --body-file"
+      if [ "$arm" = "github" ]; then
+        url=$(gh issue comment "$num" --repo "$slug" --body-file "$ISSUE_BODY_FILE") \
+          || forge_fail "gh issue comment $num failed"
+        jq -n --arg url "$url" '{url:$url}'
+      else
+        payload=$(jq -n --rawfile b "$ISSUE_BODY_FILE" '{body:$b}')
+        raw=$(gl_write "projects/$slug/issues/$num/notes" POST "$payload") \
+          || forge_fail "glab issue comment $num failed"
+        # A GitLab note carries no web URL of its own; the anchor on the issue page is the
+        # addressable thing, so it is built here rather than handing the caller a null.
+        printf '%s' "$raw" | jq --arg base "https://$(arm_host)/$(remote_path)/-/issues/$num" \
+          '{url: ($base + "#note_" + (.id|tostring))}'
+      fi ;;
+
+    reopen)
+      if [ "$arm" = "github" ]; then
+        set -- issue reopen "$num" --repo "$slug"
+        [ -n "$ISSUE_COMMENT" ] && set -- "$@" --comment "$ISSUE_COMMENT"
+        gh "$@" >/dev/null || forge_fail "gh issue reopen $num failed"
+        jq -n --argjson n "$num" '{number:$n, state:"open"}'
+      else
+        payload=$(jq -n --arg c "$ISSUE_COMMENT" \
+          '{state_event:"reopen"} + (if $c == "" then {} else {} end)')
+        raw=$(gl_write "projects/$slug/issues/$num" PUT "$payload") \
+          || forge_fail "glab issue reopen $num failed"
+        if [ -n "$ISSUE_COMMENT" ]; then
+          gl_write "projects/$slug/issues/$num/notes" POST \
+            "$(jq -n --arg b "$ISSUE_COMMENT" '{body:$b}')" >/dev/null \
+            || forge_fail "glab issue reopen $num: the note failed"
+        fi
+        printf '%s' "$raw" | jq '{number:.iid, state:"open"}'
+      fi ;;
+
+    templates)
+      # Read off the working tree, not the API: both forges keep templates as committed files, and
+      # create-issue Step 4 wants the paths so it can read the forms themselves.
+      local dir
+      if [ "$arm" = "github" ]; then dir="$ROOT/.github/ISSUE_TEMPLATE"; else dir="$ROOT/.gitlab/issue_templates"; fi
+      # An absent directory is an empty answer with a zero exit — a repository may legitimately
+      # carry no templates, and create-issue falls back to house style rather than refusing.
+      [ -d "$dir" ] || return 0
+      find "$dir" -maxdepth 1 -type f | LC_ALL=C sort ;;
+
+    *) die_usage "unknown issue sub-verb: $sub" ;;
+  esac
+}
+
 # --------------------------------------------------------------------------------------- dispatch
 case "$VERB" in
-  kind) verb_kind "$@" ;;
-  slug) verb_slug "$@" ;;
-  auth) verb_auth "$@" ;;
-  *)    die_usage "unknown verb: $VERB" ;;
+  kind)  verb_kind "$@" ;;
+  slug)  verb_slug "$@" ;;
+  auth)  verb_auth "$@" ;;
+  issue) verb_issue "$@" ;;
+  *)     die_usage "unknown verb: $VERB" ;;
 esac

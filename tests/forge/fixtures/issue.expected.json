@@ -1,0 +1,9 @@
+{
+  "number": 47,
+  "title": "Add CSV export",
+  "state": "open",
+  "labels": [
+    "enhancement",
+    "effort: small"
+  ]
+}
