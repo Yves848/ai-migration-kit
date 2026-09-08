@@ -258,6 +258,98 @@ if [ -s "$WORK/gh-calls.bad-sleep-override.log" ]; then
 $(sed 's/^/    /' "$WORK/gh-calls.bad-sleep-override.log")"
 fi
 
+# ============================================================ 11. the GitLab arm (-A gitlab), #1
+#
+# The forge dispatcher routes BOTH arms through this guard rather than letting the GitLab side call
+# `glab` directly — the guard convention says a destructive operation is never the raw command, and
+# a second forge must not become a way around it. What is being pinned here is that the guard's
+# CONTRACT is arm-independent: the same five verdicts, decided the same way (read the state back,
+# never trust the merge call's exit code), and the same refusals.
+#
+# GitLab's own vocabulary differs and is mapped here: an MR is `merged`/`opened`/`closed`/`locked`,
+# and its merge-queue analogue is `merge_when_pipeline_succeeds` — an MR that stays `opened` after
+# a successful merge call, which is exactly the QUEUED shape GitHub's merge queue produces.
+cat > "$WORK/bin/glab" <<'STUB'
+#!/usr/bin/env bash
+echo "ARGS: $*" >> "$GH_CALL_LOG"
+endpoint="${2:-}"
+case "$endpoint" in
+  */merge)
+    # The payload arrives on stdin (`--input -`). Draining it is not politeness: an unread stdin
+    # makes the writer's `printf` take SIGPIPE, which under the caller's `pipefail` would look like
+    # a failed merge call. Logging it is what lets a case assert on what was actually sent.
+    payload=$(cat)
+    printf 'PAYLOAD: %s\n' "$(printf '%s' "$payload" | tr -d '\n')" >> "$GH_CALL_LOG"
+    [ -n "${GLAB_MERGE_STDERR:-}" ] && echo "$GLAB_MERGE_STDERR" >&2
+    exit "${GLAB_MERGE_RC:-0}" ;;
+  *)
+    count=0
+    [ -f "$GH_VIEW_COUNT_FILE" ] && count=$(cat "$GH_VIEW_COUNT_FILE")
+    count=$((count + 1))
+    echo "$count" > "$GH_VIEW_COUNT_FILE"
+    if [ "$count" -le "${GLAB_VIEW_FAIL_FIRST_N:-0}" ]; then exit "${GLAB_VIEW_RC:-1}"; fi
+    printf '{"state":"%s","merged_at":"%s","merge_commit_sha":"%s","squash_commit_sha":""}\n' \
+      "${GLAB_VIEW_STATE:-merged}" "${GLAB_VIEW_MERGED_AT:-2026-09-08T00:00:00Z}" \
+      "${GLAB_VIEW_SHA:-deadbeef}"
+    exit 0 ;;
+esac
+STUB
+chmod +x "$WORK/bin/glab"
+
+GLAB_MERGE_RC=0 GLAB_VIEW_STATE=merged GLAB_VIEW_SHA=deadbeef \
+run_case gl-merged 0 "MERGED deadbeef" 'gitlab: state merged -> MERGED with the sha' \
+  -A gitlab -P group%2Fwidgets 281 -- --squash --subject "feat(x): y (#1) (#2)"
+
+# The squash message is not optional decoration: this repo squash-merges and the subject IS the
+# commit release-please parses. Assert it actually reached the API, not just that the call happened.
+if ! grep -q 'squash_commit_message' "$WORK/gh-calls.gl-merged.log"; then
+  note_fail "gl-merged — the merge payload carried no squash_commit_message:
+$(sed 's/^/    /' "$WORK/gh-calls.gl-merged.log")"
+fi
+if ! grep -q 'merge_requests/281/merge' "$WORK/gh-calls.gl-merged.log"; then
+  note_fail "gl-merged — the merge did not target merge_requests/281/merge:
+$(sed 's/^/    /' "$WORK/gh-calls.gl-merged.log")"
+fi
+
+GLAB_MERGE_RC=1 GLAB_VIEW_STATE=opened GLAB_MERGE_STDERR="405 Method Not Allowed" \
+run_case gl-rejected 2 "REJECTED" 'gitlab: still opened and the merge call failed -> REJECTED' \
+  -A gitlab -P group%2Fwidgets 281 -- --squash --subject "s"
+
+GLAB_MERGE_RC=0 GLAB_VIEW_STATE=opened \
+run_case gl-queued 1 "QUEUED" 'gitlab: still opened but the merge call succeeded (MWPS) -> QUEUED' \
+  -A gitlab -P group%2Fwidgets 281 -- --squash --subject "s"
+
+GLAB_MERGE_RC=0 GLAB_VIEW_STATE=closed \
+run_case gl-closed 3 "CLOSED" 'gitlab: closed without merging -> CLOSED' \
+  -A gitlab -P group%2Fwidgets 281 -- --squash --subject "s"
+
+GLAB_MERGE_RC=0 GLAB_VIEW_STATE=locked \
+run_case gl-weird 4 "UNCONFIRMED" 'gitlab: an unrecognised state -> UNCONFIRMED, never a rejection' \
+  -A gitlab -P group%2Fwidgets 281 -- --squash --subject "s"
+
+GLAB_MERGE_RC=0 GLAB_VIEW_FAIL_FIRST_N=99 GLAB_VIEW_RC=1 \
+run_case gl-unreadable 4 "UNCONFIRMED" 'gitlab: the readback never answers -> UNCONFIRMED, nothing torn down' \
+  -A gitlab -P group%2Fwidgets 281 -- --squash --subject "s"
+
+# The REFUSAL path, per the guard convention — a guard whose refusal is untested is not a guard.
+# `-A gitlab` without `-P` cannot address a project, and guessing one would send a merge at the
+# wrong repository. Exit 64 (nothing attempted), never 2 (GitHub/GitLab said no).
+GLAB_MERGE_RC=0 GLAB_VIEW_STATE=merged \
+run_case gl-no-project 64 "" 'gitlab without -P -> refuses (exit 64), no forge call' \
+  -A gitlab 281 -- --squash --subject "s"
+if [ -s "$WORK/gh-calls.gl-no-project.log" ]; then
+  note_fail "gl-no-project — refused but still called the forge:
+$(sed 's/^/    /' "$WORK/gh-calls.gl-no-project.log")"
+fi
+
+GLAB_MERGE_RC=0 GLAB_VIEW_STATE=merged \
+run_case bad-arm 64 "" 'an unknown -A value -> refuses (exit 64), no forge call' \
+  -A bitbucket -P x 281 -- --squash --subject "s"
+if [ -s "$WORK/gh-calls.bad-arm.log" ]; then
+  note_fail "bad-arm — refused but still called the forge:
+$(sed 's/^/    /' "$WORK/gh-calls.bad-arm.log")"
+fi
+
 # ---------------------------------------------------------------------------------------- verdict
 if [ "$FAILED" -ne 0 ]; then
   echo

@@ -315,6 +315,10 @@ parse_issue_opts() {
       --search)    [ $# -ge 2 ] || die_usage "--search needs a value";    ISSUE_SEARCH="$2"; shift 2 ;;
       --limit)     [ $# -ge 2 ] || die_usage "--limit needs a value";     ISSUE_LIMIT="$2";  shift 2 ;;
       --head)      [ $# -ge 2 ] || die_usage "--head needs a value";      PR_HEAD="$2";      shift 2 ;;
+      --base)      [ $# -ge 2 ] || die_usage "--base needs a value";      PR_BASE="$2";      shift 2 ;;
+      --subject)   [ $# -ge 2 ] || die_usage "--subject needs a value";   PR_SUBJECT="$2";   shift 2 ;;
+      --draft)     PR_DRAFT=1;  shift ;;
+      --squash)    PR_SQUASH=1; shift ;;
       --title)     [ $# -ge 2 ] || die_usage "--title needs a value";     ISSUE_TITLE="$2";  shift 2 ;;
       --comment)   [ $# -ge 2 ] || die_usage "--comment needs a value";   ISSUE_COMMENT="$2"; shift 2 ;;
       --body-file) [ $# -ge 2 ] || die_usage "--body-file needs a value"
@@ -569,15 +573,26 @@ NORM_CHECKS_GL='map({
                elif .status == "skipped" then "skipped"
                else null end) })'
 
-PR_HEAD=""
+PR_HEAD=""; PR_BASE=""; PR_SUBJECT=""; PR_DRAFT=0; PR_SQUASH=0
 GH_PR_JSON_FIELDS=number,title,body,state,isDraft,headRefName,baseRefName,headRefOid,url,mergeable,mergeStateStatus,reviewDecision
+
+# The kit root, resolved from this script's own location rather than from the caller's working
+# directory — `forge pr merge` has to reach the merge guard, and the caller is routinely inside a
+# linked worktree of some other repository entirely.
+FORGE_DIR=$(cd "$(dirname "$0")" && pwd)
+KIT_ROOT=$(dirname "$FORGE_DIR")
+MERGE_GUARD="$KIT_ROOT/skills/merge-pr/scripts/guarded-pr-merge.sh"
+
+# GitLab's draft mechanism is the title prefix and nothing else, so these two are the whole of it.
+GL_DRAFT_PREFIX="Draft: "
+gl_undraft() { printf '%s' "${1#"$GL_DRAFT_PREFIX"}"; }
 
 verb_pr() {
   local sub="${1:-}"; [ -n "$sub" ] || die_usage "pr needs a sub-verb"
   shift
   local num=""
   case "$sub" in
-    view|diff|checks)
+    view|diff|checks|ready|merge|comment)
       num="${1:-}"
       case "$num" in ''|*[!0-9]*) die_usage "pr $sub needs a merge-request number" ;; esac
       shift ;;
@@ -651,6 +666,82 @@ verb_pr() {
         printf '%s' "$raw" | jq -r '
           .changes[]
           | "diff --git a/\(.old_path) b/\(.new_path)\n--- a/\(.old_path)\n+++ b/\(.new_path)\n\(.diff)"'
+      fi ;;
+
+    create)
+      [ -n "$ISSUE_TITLE" ]     || die_usage "pr create needs --title"
+      [ -n "$ISSUE_BODY_FILE" ] || die_usage "pr create needs --body-file"
+      [ -n "$PR_HEAD" ]         || die_usage "pr create needs --head"
+      [ -n "$PR_BASE" ]         || die_usage "pr create needs --base"
+      if [ "$arm" = "github" ]; then
+        set -- pr create --repo "$slug" --base "$PR_BASE" --head "$PR_HEAD" \
+               --title "$ISSUE_TITLE" --body-file "$ISSUE_BODY_FILE"
+        [ "$PR_DRAFT" -eq 1 ] && set -- "$@" --draft
+        url=$(gh "$@") || forge_fail "gh pr create failed"
+        jq -n --arg url "$url" '{number: ($url | split("/") | last | tonumber), url: $url}'
+      else
+        # The prefix IS the draft flag on this arm. It goes on at creation because GitLab has no
+        # other way to say it, and `pr ready` below is what takes it off again.
+        local title="$ISSUE_TITLE"
+        [ "$PR_DRAFT" -eq 1 ] && title="$GL_DRAFT_PREFIX$ISSUE_TITLE"
+        payload=$(jq -n --arg t "$title" --rawfile d "$ISSUE_BODY_FILE" \
+          --arg src "$PR_HEAD" --arg tgt "$PR_BASE" \
+          '{title:$t, description:$d, source_branch:$src, target_branch:$tgt}')
+        raw=$(gl_write "projects/$slug/merge_requests" POST "$payload") \
+          || forge_fail "glab merge-request create failed"
+        printf '%s' "$raw" | jq '{number:.iid, url:.web_url}'
+      fi ;;
+
+    ready)
+      if [ "$arm" = "github" ]; then
+        gh pr ready "$num" --repo "$slug" >/dev/null || forge_fail "gh pr ready $num failed"
+      else
+        # Read the title before editing it: this arm can only strip a prefix it has seen, and
+        # writing a title it guessed would either re-draft a ready MR or discard a real one.
+        raw=$(glab api "projects/$slug/merge_requests/$num") \
+          || forge_fail "glab api merge_requests/$num failed"
+        local cur; cur=$(printf '%s' "$raw" | jq -r '.title')
+        payload=$(jq -n --arg t "$(gl_undraft "$cur")" '{title:$t}')
+        gl_write "projects/$slug/merge_requests/$num" PUT "$payload" >/dev/null \
+          || forge_fail "glab merge-request ready $num failed"
+      fi
+      jq -n --argjson n "$num" '{number:$n, isDraft:false}' ;;
+
+    merge)
+      # NEVER the raw command, on either arm. The guard convention (README, "Hardening a
+      # destructive operation") is why: a merge is the largest irreversible write in this flow, and
+      # a second forge must not become the way around the one script that decides its outcome from
+      # the forge's state rather than from a CLI's exit code (#184). forge.sh supplies the arm and
+      # the project it has already resolved; the verdict stays the guard's.
+      [ -x "$MERGE_GUARD" ] || forge_fail "the merge guard is missing at $MERGE_GUARD"
+      set -- "$num"
+      if [ "$arm" = "github" ]; then set -- -R "$slug" "$@"; else set -- -A gitlab -P "$slug" "$@"; fi
+      set -- "$@" -- --squash --delete-branch
+      [ -n "$PR_SUBJECT" ] && set -- "$@" --subject "$PR_SUBJECT"
+      local verdict grc=0
+      verdict=$("$MERGE_GUARD" "$@") || grc=$?
+      case "$verdict" in
+        MERGED*) jq -n --argjson n "$num" '{number:$n, merged:true}' ;;
+        *)
+          # QUEUED, REJECTED, CLOSED and UNCONFIRMED all mean "not landed", and each means
+          # something different about what to do next — so the guard's own word is passed through
+          # rather than flattened into a boolean the caller would misread as a failure to retry.
+          echo "forge: the merge did not land — the guard returned '$verdict' (exit $grc)." >&2
+          exit 1 ;;
+      esac ;;
+
+    comment)
+      [ -n "$ISSUE_BODY_FILE" ] || die_usage "pr comment needs --body-file"
+      if [ "$arm" = "github" ]; then
+        url=$(gh pr comment "$num" --repo "$slug" --body-file "$ISSUE_BODY_FILE") \
+          || forge_fail "gh pr comment $num failed"
+        jq -n --arg url "$url" '{url:$url}'
+      else
+        payload=$(jq -n --rawfile b "$ISSUE_BODY_FILE" '{body:$b}')
+        raw=$(gl_write "projects/$slug/merge_requests/$num/notes" POST "$payload") \
+          || forge_fail "glab merge-request comment $num failed"
+        printf '%s' "$raw" | jq --arg base "https://$(arm_host)/$(remote_path)/-/merge_requests/$num" \
+          '{url: ($base + "#note_" + (.id|tostring))}'
       fi ;;
 
     *) die_usage "unknown pr sub-verb: $sub" ;;

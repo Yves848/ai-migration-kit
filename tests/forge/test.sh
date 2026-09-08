@@ -48,9 +48,12 @@ cat > "$WORK/bin/gh" <<'STUB'
 # `--repo <slug>` is REQUIRED on every issue/pr subcommand: forge.sh never cd's, so a real gh
 # would otherwise resolve the repository from the process's own working directory. Rejecting the
 # invocation that lacks it is what keeps this stub honest about that contract.
+# Real gh accepts `--repo` and its short form `-R` interchangeably, and the two callers here use
+# different ones (forge.sh spells it out; guarded-pr-merge.sh has always passed -R). A stub that
+# knew only one spelling would refuse a perfectly valid invocation and report it as a forge failure.
 needs_repo() {
-  case " $* " in *" --repo "*) return 0 ;; esac
-  echo "gh stub: '$1 $2' called without --repo" >&2; exit 65
+  case " $* " in *" --repo "*|*" -R "*) return 0 ;; esac
+  echo "gh stub: '$1 $2' called without --repo/-R" >&2; exit 65
 }
 case "$1 $2" in
   "auth status")
@@ -77,8 +80,26 @@ case "$1 $2" in
     echo "https://github.com/acme/widgets/issues/47#issuecomment-5150"; exit 0 ;;
   "pr view")
     needs_repo "$@"
+    # guarded-pr-merge.sh asks for a TSV readback (`--jq '[…] | @tsv'`); forge.sh's own reads ask
+    # for the JSON document. Telling them apart by the presence of --jq is what lets one stub serve
+    # both without either pretending to be the other.
+    case " $* " in
+      *" --jq "*)
+        printf '%s\t%s\t%s\n' "${GH_VIEW_STATE:-MERGED}" "${GH_VIEW_MERGED_AT:-2026-09-08T00:00:00Z}" "${GH_VIEW_SHA:-cafef00d}"
+        exit 0 ;;
+    esac
     [ -n "${GH_PR_FIXTURE:-}" ] || { echo "GH_PR_FIXTURE not set" >&2; exit 1; }
     cat "$GH_PR_FIXTURE"; exit 0 ;;
+  "pr merge")
+    exit "${GH_MERGE_RC:-0}" ;;
+  "pr create")
+    needs_repo "$@"
+    echo "https://github.com/acme/widgets/pull/281"; exit 0 ;;
+  "pr ready")
+    needs_repo "$@"; exit 0 ;;
+  "pr comment")
+    needs_repo "$@"
+    echo "https://github.com/acme/widgets/pull/281#issuecomment-77"; exit 0 ;;
   "pr list")
     needs_repo "$@"
     [ -n "${GH_PRS_FIXTURE:-}" ] || { echo "GH_PRS_FIXTURE not set" >&2; exit 1; }
@@ -690,4 +711,107 @@ printf '%s\n' "$out" | grep -q '^diff --git a/a.txt b/a.txt' \
   || fail "pr diff (gitlab): missing the synthesised git header, got '$out'"
 printf '%s\n' "$out" | grep -q '^+new' || fail "pr diff (gitlab): the hunk was lost, got '$out'"
 
-echo "OK: forge.sh — arm resolution, kind, slug, auth, issue verbs, merge-request reads"
+# =========================================== 14. pr create / ready — the Draft: prefix, both ways
+#
+# The asymmetry that has to be hidden: opening a draft is a FLAG on GitHub and a TITLE PREFIX on
+# GitLab, and flipping to ready is a state transition on one and a title EDIT on the other. A
+# caller that had to know which would be a caller that has to know the forge.
+
+repo=$(mkrepo prcreate-gh "https://github.com/acme/widgets.git")
+printf 'pr body\n' > "$WORK/prbody.md"
+log="$WORK/prcreate-gh.log"; : > "$log"
+out=$(FORGE_STUB_LOG="$log" bash "$FORGE" -C "$repo" pr create --title "add X" \
+  --body-file "$WORK/prbody.md" --base main --head feat/1-x --draft) \
+  || fail "pr create (github): non-zero exit"
+[ "$(printf '%s\n' "$out" | jq -r .number)" = "281" ] || fail "pr create (github): got '$out'"
+grep -q -- '--draft' "$log" || fail "pr create (github): --draft not passed — log: $(cat "$log")"
+
+cat > "$WORK/gl-created-mr.json" <<'JSON'
+{"iid": 281, "web_url": "https://gitlab.example.com/group/widgets/-/merge_requests/281"}
+JSON
+log="$WORK/prcreate-gl.log"; : > "$log"
+out=$(FORGE_STUB_LOG="$log" GLAB_FIXTURE="$WORK/gl-created-mr.json" \
+  bash "$FORGE" -C "$repo_gl" pr create --title "add X" --body-file "$WORK/prbody.md" \
+  --base main --head feat/1-x --draft) || fail "pr create (gitlab): non-zero exit"
+[ "$(printf '%s\n' "$out" | jq -r .number)" = "281" ] || fail "pr create (gitlab): got '$out'"
+payload=$(grep '^glab-payload ' "$log" | sed 's/^glab-payload //')
+[ "$(printf '%s' "$payload" | jq -r .title)" = "Draft: add X" ] \
+  || fail "pr create (gitlab, --draft): title must carry the Draft: prefix, got '$payload'"
+[ "$(printf '%s' "$payload" | jq -r .source_branch)" = "feat/1-x" ] \
+  || fail "pr create (gitlab): --head must become source_branch, got '$payload'"
+[ "$(printf '%s' "$payload" | jq -r .target_branch)" = "main" ] \
+  || fail "pr create (gitlab): --base must become target_branch, got '$payload'"
+
+# Without --draft the prefix must NOT appear — otherwise every MR this kit opens would be a draft.
+log="$WORK/prcreate-gl2.log"; : > "$log"
+FORGE_STUB_LOG="$log" GLAB_FIXTURE="$WORK/gl-created-mr.json" \
+  bash "$FORGE" -C "$repo_gl" pr create --title "add X" --body-file "$WORK/prbody.md" \
+  --base main --head feat/1-x >/dev/null || fail "pr create (gitlab, no draft): non-zero exit"
+payload=$(grep '^glab-payload ' "$log" | sed 's/^glab-payload //')
+[ "$(printf '%s' "$payload" | jq -r .title)" = "add X" ] \
+  || fail "pr create (gitlab, no --draft): title must be unprefixed, got '$payload'"
+
+# ready: GitHub transitions state; GitLab edits the title. The GitLab arm must READ the current
+# title first — it can only strip a prefix it has seen.
+repo=$(mkrepo prready-gh "https://github.com/acme/widgets.git")
+log="$WORK/prready-gh.log"; : > "$log"
+out=$(FORGE_STUB_LOG="$log" bash "$FORGE" -C "$repo" pr ready 281) \
+  || fail "pr ready (github): non-zero exit"
+[ "$(printf '%s\n' "$out" | jq -r .isDraft)" = "false" ] || fail "pr ready (github): got '$out'"
+grep -q 'gh pr ready 281' "$log" || fail "pr ready (github): gh pr ready never called — log: $(cat "$log")"
+
+log="$WORK/prready-gl.log"; : > "$log"
+out=$(FORGE_STUB_LOG="$log" GLAB_FIXTURE="$WORK/gl-pr.json" \
+  bash "$FORGE" -C "$repo_gl" pr ready 281) || fail "pr ready (gitlab): non-zero exit"
+[ "$(printf '%s\n' "$out" | jq -r .isDraft)" = "false" ] || fail "pr ready (gitlab): got '$out'"
+payload=$(grep '^glab-payload ' "$log" | sed 's/^glab-payload //')
+[ "$(printf '%s' "$payload" | jq -r .title)" = "add X" ] \
+  || fail "pr ready (gitlab): the PUT must carry the title WITHOUT 'Draft: ', got '$payload'"
+
+# ================================================ 15. pr merge — through the guard, on both arms
+#
+# The guard convention (README, "Hardening a destructive operation"): a destructive operation is
+# never the raw command. Adding a second forge must not become a way around that, so BOTH arms go
+# through skills/merge-pr/scripts/guarded-pr-merge.sh and neither calls the forge directly. What
+# the guard does per arm is its own suite's business (tests/guarded-pr-merge/test.sh); what this
+# case pins is that forge.sh reaches it and honours its verdict.
+
+repo=$(mkrepo prmerge-gh "https://github.com/acme/widgets.git")
+log="$WORK/prmerge-gh.log"; : > "$log"
+out=$(FORGE_STUB_LOG="$log" GH_MERGE_RC=0 GH_VIEW_STATE=MERGED GH_VIEW_SHA=cafef00d \
+  GUARDED_PR_MERGE_READBACK_SLEEP=0 \
+  bash "$FORGE" -C "$repo" pr merge 281 --squash --subject "feat(x): y (#1) (#2)") \
+  || fail "pr merge (github): non-zero exit"
+[ "$(printf '%s\n' "$out" | jq -r .merged)" = "true" ] || fail "pr merge (github): got '$out'"
+grep -q 'gh pr merge 281' "$log" \
+  || fail "pr merge (github): the guard never reached gh pr merge — log: $(cat "$log")"
+
+# A verdict that is not MERGED is a non-zero exit, never a cheerful {"merged":true}. QUEUED and
+# REJECTED both mean "not landed", and a caller that read them as success would tear down a branch
+# whose work is still open.
+repo=$(mkrepo prmerge-rej "https://github.com/acme/widgets.git")
+rc=0; out=$(GH_MERGE_RC=1 GH_VIEW_STATE=OPEN GUARDED_PR_MERGE_READBACK_SLEEP=0 \
+  bash "$FORGE" -C "$repo" pr merge 281 --squash --subject "s" 2>/dev/null) || rc=$?
+[ "$rc" -ne 0 ] || fail "pr merge (github, REJECTED): must exit non-zero, got '$out'"
+
+# ============================================================================ 16. pr comment
+
+repo=$(mkrepo prcomment-gh "https://github.com/acme/widgets.git")
+out=$(bash "$FORGE" -C "$repo" pr comment 281 --body-file "$WORK/prbody.md") \
+  || fail "pr comment (github): non-zero exit"
+[ "$(printf '%s\n' "$out" | jq -r .url)" = "https://github.com/acme/widgets/pull/281#issuecomment-77" ] \
+  || fail "pr comment (github): got '$out'"
+
+cat > "$WORK/gl-note.json" <<'JSON'
+{"id": 4242}
+JSON
+log="$WORK/prcomment-gl.log"; : > "$log"
+out=$(FORGE_STUB_LOG="$log" GLAB_FIXTURE="$WORK/gl-note.json" \
+  bash "$FORGE" -C "$repo_gl" pr comment 281 --body-file "$WORK/prbody.md") \
+  || fail "pr comment (gitlab): non-zero exit"
+printf '%s\n' "$out" | jq -e '.url | test("merge_requests/281#note_4242")' >/dev/null \
+  || fail "pr comment (gitlab): expected an anchored note URL, got '$out'"
+grep -q 'merge_requests/281/notes' "$log" \
+  || fail "pr comment (gitlab): wrong endpoint — log: $(cat "$log")"
+
+echo "OK: forge.sh — arm resolution, kind, slug, auth, issue verbs, merge-request reads and writes"
