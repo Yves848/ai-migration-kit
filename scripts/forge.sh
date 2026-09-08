@@ -314,6 +314,7 @@ parse_issue_opts() {
       --state)     [ $# -ge 2 ] || die_usage "--state needs a value";     ISSUE_STATE="$2";  shift 2 ;;
       --search)    [ $# -ge 2 ] || die_usage "--search needs a value";    ISSUE_SEARCH="$2"; shift 2 ;;
       --limit)     [ $# -ge 2 ] || die_usage "--limit needs a value";     ISSUE_LIMIT="$2";  shift 2 ;;
+      --head)      [ $# -ge 2 ] || die_usage "--head needs a value";      PR_HEAD="$2";      shift 2 ;;
       --title)     [ $# -ge 2 ] || die_usage "--title needs a value";     ISSUE_TITLE="$2";  shift 2 ;;
       --comment)   [ $# -ge 2 ] || die_usage "--comment needs a value";   ISSUE_COMMENT="$2"; shift 2 ;;
       --body-file) [ $# -ge 2 ] || die_usage "--body-file needs a value"
@@ -480,11 +481,188 @@ verb_issue() {
   esac
 }
 
+# --------------------------------------------------------------- merge-request normalisation
+#
+# Three places the forges disagree about FACTS, not spellings. Each is spent here, once.
+#
+# 1. Draft. GitHub has an `isDraft` boolean. GitLab has a `Draft: ` TITLE PREFIX and nothing else,
+#    so the prefix is stripped from the normalised title: a skill that read the raw title would
+#    re-send it on the next edit and silently push the MR back into draft.
+# 2. Blockers. `mergeStateStatus` (CLEAN/BEHIND/DIRTY/BLOCKED/UNSTABLE/DRAFT) and
+#    `detailed_merge_status` (mergeable/broken_status/ci_still_running/discussions_not_resolved/
+#    draft_status/not_approved/need_rebase/…) are not subsets of one another. The mapping below is
+#    a stated policy, and it is LOSSY IN ONE DIRECTION: GitHub's single BLOCKED cannot say whether
+#    review or discussion is what blocks, so it maps to `not_approved`, the commoner cause. An
+#    unrecognised GitLab status is carried through VERBATIM rather than dropped — a blocker nobody
+#    mapped must still read as a blocker, because the alternative is a blocked MR that looks clean.
+# 3. Approval. GitLab approval rules are a paid feature and the free API cannot express "changes
+#    requested" at all, so `reviewDecision` is `approved` or `none` on that arm — never a third
+#    value invented to look symmetric.
+NORM_PR_GH='
+def msmap($s):
+  if   $s == "BEHIND"   then "behind_base"
+  elif $s == "DIRTY"    then "conflicting"
+  elif $s == "BLOCKED"  then "not_approved"
+  elif $s == "UNSTABLE" then "ci_running"
+  elif $s == "DRAFT"    then "draft"
+  else empty end;
+{ number: .number,
+  title: .title,
+  body: (.body // ""),
+  state: (.state | ascii_downcase),
+  isDraft: (.isDraft // false),
+  headRefName: .headRefName,
+  baseRefName: .baseRefName,
+  headSha: .headRefOid,
+  url: .url,
+  mergeable: (if .mergeable == "MERGEABLE" then "clean"
+              elif .mergeable == "CONFLICTING" then "conflicting"
+              else "unknown" end),
+  mergeBlockers: ([ (if (.isDraft // false) then "draft" else empty end),
+                    msmap(.mergeStateStatus // ""),
+                    (if .reviewDecision == "CHANGES_REQUESTED" then "not_approved" else empty end)
+                  ] | unique),
+  reviewDecision: (if .reviewDecision == "APPROVED" then "approved"
+                   elif .reviewDecision == "CHANGES_REQUESTED" then "changes_requested"
+                   else "none" end) }'
+
+NORM_PR_GL='
+def dmsmap($s):
+  if   $s == null or $s == "" or $s == "mergeable" then empty
+  elif $s == "broken_status" or $s == "conflict"   then "conflicting"
+  elif $s == "ci_still_running" or $s == "ci_must_pass" then "ci_running"
+  elif $s == "discussions_not_resolved"            then "threads_unresolved"
+  elif $s == "draft_status"                        then "draft"
+  elif $s == "not_approved"                        then "not_approved"
+  elif $s == "need_rebase"                         then "behind_base"
+  else $s end;
+(.title // "") as $t
+| ($t | startswith("Draft: ")) as $d
+| { number: .iid,
+    title: (if $d then ($t | ltrimstr("Draft: ")) else $t end),
+    body: (.description // ""),
+    state: (if .state == "opened" then "open" else (.state | ascii_downcase) end),
+    isDraft: $d,
+    headRefName: .source_branch,
+    baseRefName: .target_branch,
+    headSha: .sha,
+    url: .web_url,
+    mergeable: (if (.has_conflicts // false) then "conflicting"
+                elif .detailed_merge_status == "mergeable" then "clean"
+                else "unknown" end),
+    mergeBlockers: ([ (if $d then "draft" else empty end),
+                      dmsmap(.detailed_merge_status) ] | unique),
+    reviewDecision: (if ((.approvals_required // 0) > 0)
+                        and (((.approved_by // []) | length) >= (.approvals_required // 0))
+                     then "approved" else "none" end) }'
+
+# GitLab job status -> the GitHub check-run pair the kit normalised on. GitLab folds "did it run"
+# and "how did it end" into one field; the kit keeps them apart because a caller waiting for CI has
+# to tell "still going" from "finished badly", and one field cannot say both.
+NORM_CHECKS_GL='map({
+  name: .name,
+  status: (if (.status == "success" or .status == "failed" or .status == "canceled" or .status == "skipped")
+           then "completed" elif .status == "running" then "in_progress" else "queued" end),
+  conclusion: (if .status == "success" then "success"
+               elif .status == "failed" then "failure"
+               elif .status == "canceled" then "cancelled"
+               elif .status == "skipped" then "skipped"
+               else null end) })'
+
+PR_HEAD=""
+GH_PR_JSON_FIELDS=number,title,body,state,isDraft,headRefName,baseRefName,headRefOid,url,mergeable,mergeStateStatus,reviewDecision
+
+verb_pr() {
+  local sub="${1:-}"; [ -n "$sub" ] || die_usage "pr needs a sub-verb"
+  shift
+  local num=""
+  case "$sub" in
+    view|diff|checks)
+      num="${1:-}"
+      case "$num" in ''|*[!0-9]*) die_usage "pr $sub needs a merge-request number" ;; esac
+      shift ;;
+  esac
+  parse_issue_opts "$@"
+
+  local arm slug raw sha pipeline
+  arm=$(arm_or_die)
+  slug=$(slug_value "$arm")
+
+  case "$sub" in
+    view)
+      if [ "$arm" = "github" ]; then
+        raw=$(gh pr view "$num" --repo "$slug" --json "$GH_PR_JSON_FIELDS") \
+          || forge_fail "gh pr view $num failed"
+        printf '%s' "$raw" | jq "$NORM_PR_GH" | project "$ISSUE_FIELDS"
+      else
+        raw=$(glab api "projects/$slug/merge_requests/$num") \
+          || forge_fail "glab api projects/$slug/merge_requests/$num failed"
+        printf '%s' "$raw" | jq "$NORM_PR_GL" | project "$ISSUE_FIELDS"
+      fi ;;
+
+    list)
+      if [ "$arm" = "github" ]; then
+        set -- pr list --repo "$slug" --json "$GH_PR_JSON_FIELDS"
+        [ -n "$PR_HEAD" ]     && set -- "$@" --head "$PR_HEAD"
+        [ -n "$ISSUE_STATE" ] && set -- "$@" --state "$ISSUE_STATE"
+        [ -n "$ISSUE_LIMIT" ] && set -- "$@" --limit "$ISSUE_LIMIT"
+        raw=$(gh "$@") || forge_fail "gh pr list failed"
+        printf '%s' "$raw" | jq "map($NORM_PR_GH)" | project "$ISSUE_FIELDS"
+      else
+        local q="projects/$slug/merge_requests?per_page=${ISSUE_LIMIT:-100}"
+        [ -n "$PR_HEAD" ]     && q="$q&source_branch=$PR_HEAD"
+        [ -n "$ISSUE_STATE" ] && q="$q&state=$(gl_state "$ISSUE_STATE")"
+        raw=$(glab api "$q") || forge_fail "glab api $q failed"
+        printf '%s' "$raw" | jq "map($NORM_PR_GL)" | project "$ISSUE_FIELDS"
+      fi ;;
+
+    checks)
+      if [ "$arm" = "github" ]; then
+        # The head SHA, then that commit's check-runs. Asked of the MR rather than of the local
+        # branch: the caller may not have the branch checked out, and the remote is the authority.
+        sha=$(gh pr view "$num" --repo "$slug" --json headRefOid --jq .headRefOid) \
+          || forge_fail "gh pr view $num (headRefOid) failed"
+        raw=$(gh api "repos/$slug/commits/$sha/check-runs") \
+          || forge_fail "gh api check-runs for $sha failed"
+        printf '%s' "$raw" | jq '.check_runs | map({name, status, conclusion})'
+      else
+        # Two round trips, because GitLab hangs jobs off a PIPELINE and pipelines off the MR.
+        raw=$(glab api "projects/$slug/merge_requests/$num/pipelines") \
+          || forge_fail "glab api merge_requests/$num/pipelines failed"
+        pipeline=$(printf '%s' "$raw" | jq -r '.[0].id // empty')
+        # No pipeline is a legitimate empty answer (a merge request whose CI never ran), and it is
+        # NOT the same as a query that failed — which forge_fail above has already turned into a
+        # non-zero exit.
+        [ -n "$pipeline" ] || { echo '[]'; return 0; }
+        raw=$(glab api "projects/$slug/pipelines/$pipeline/jobs") \
+          || forge_fail "glab api pipelines/$pipeline/jobs failed"
+        printf '%s' "$raw" | jq "$NORM_CHECKS_GL"
+      fi ;;
+
+    diff)
+      if [ "$arm" = "github" ]; then
+        gh pr diff "$num" --repo "$slug" || forge_fail "gh pr diff $num failed"
+      else
+        # GitLab's `changes[].diff` begins at the first hunk — no `diff --git`, no `---`/`+++`.
+        # Every consumer of a diff expects that preamble, so it is synthesised from old_path and
+        # new_path rather than handing back a fragment that looks like a diff and is not one.
+        raw=$(glab api "projects/$slug/merge_requests/$num/changes") \
+          || forge_fail "glab api merge_requests/$num/changes failed"
+        printf '%s' "$raw" | jq -r '
+          .changes[]
+          | "diff --git a/\(.old_path) b/\(.new_path)\n--- a/\(.old_path)\n+++ b/\(.new_path)\n\(.diff)"'
+      fi ;;
+
+    *) die_usage "unknown pr sub-verb: $sub" ;;
+  esac
+}
+
 # --------------------------------------------------------------------------------------- dispatch
 case "$VERB" in
   kind)  verb_kind "$@" ;;
   slug)  verb_slug "$@" ;;
   auth)  verb_auth "$@" ;;
   issue) verb_issue "$@" ;;
+  pr)    verb_pr "$@" ;;
   *)     die_usage "unknown verb: $VERB" ;;
 esac

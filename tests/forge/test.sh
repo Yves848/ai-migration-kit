@@ -75,7 +75,26 @@ case "$1 $2" in
   "issue comment")
     needs_repo "$@"
     echo "https://github.com/acme/widgets/issues/47#issuecomment-5150"; exit 0 ;;
+  "pr view")
+    needs_repo "$@"
+    [ -n "${GH_PR_FIXTURE:-}" ] || { echo "GH_PR_FIXTURE not set" >&2; exit 1; }
+    cat "$GH_PR_FIXTURE"; exit 0 ;;
+  "pr list")
+    needs_repo "$@"
+    [ -n "${GH_PRS_FIXTURE:-}" ] || { echo "GH_PRS_FIXTURE not set" >&2; exit 1; }
+    cat "$GH_PRS_FIXTURE"; exit 0 ;;
+  "pr diff")
+    needs_repo "$@"
+    printf 'diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n'; exit 0 ;;
 esac
+# `gh api <endpoint>` for everything that has no porcelain: the check-runs of a commit.
+if [ "$1" = "api" ]; then
+  case "$2" in
+    */check-runs)
+      [ -n "${GH_CHECKS_FIXTURE:-}" ] || { echo "GH_CHECKS_FIXTURE not set" >&2; exit 1; }
+      cat "$GH_CHECKS_FIXTURE"; exit 0 ;;
+  esac
+fi
 echo "gh stub: unexpected invocation: $*" >&2
 exit 64
 STUB
@@ -105,10 +124,21 @@ if [ "$1" = "api" ]; then
     payload=$(cat)
     [ -n "${FORGE_STUB_LOG:-}" ] && printf 'glab-payload %s\n' "$(printf '%s' "$payload" | tr -d '\n')" >> "$FORGE_STUB_LOG"
   fi
+  # Endpoint-shaped dispatch: `forge pr checks` on this arm is TWO round trips (the MR's pipelines,
+  # then the latest pipeline's jobs), so one fixture variable cannot serve them both.
   case "$endpoint" in
     user)
       [ "${GLAB_AUTH_OK:-1}" = "1" ] || { echo "401 Unauthorized" >&2; exit 1; }
       echo '{"username":"tanuki"}'; exit 0 ;;
+    */pipelines|*/pipelines\?*)
+      [ -n "${GLAB_PIPELINES_FIXTURE:-}" ] || { echo "glab stub: no GLAB_PIPELINES_FIXTURE" >&2; exit 1; }
+      cat "$GLAB_PIPELINES_FIXTURE"; exit 0 ;;
+    */jobs|*/jobs\?*)
+      [ -n "${GLAB_JOBS_FIXTURE:-}" ] || { echo "glab stub: no GLAB_JOBS_FIXTURE" >&2; exit 1; }
+      cat "$GLAB_JOBS_FIXTURE"; exit 0 ;;
+    */changes|*/changes\?*)
+      [ -n "${GLAB_CHANGES_FIXTURE:-}" ] || { echo "glab stub: no GLAB_CHANGES_FIXTURE" >&2; exit 1; }
+      cat "$GLAB_CHANGES_FIXTURE"; exit 0 ;;
   esac
   # Everything else is fixture-driven: the case points GLAB_FIXTURE at the payload the real REST
   # endpoint would return. An unset fixture is an error, not an empty answer (#294's lesson).
@@ -484,4 +514,180 @@ repo=$(mkrepo tpl-none "https://github.com/acme/widgets.git")
 out=$(bash "$FORGE" -C "$repo" issue templates) || fail "issue templates (none): must exit 0"
 [ -z "$out" ] || fail "issue templates (none): expected no output, got '$out'"
 
-echo "OK: forge.sh — arm resolution, kind, slug, auth, issue verbs"
+# ============================================== 11. pr view — the three real semantic divergences
+#
+# This is the case the whole dispatcher exists for. A merge request is where the two forges stop
+# agreeing about facts, not just spellings:
+#
+#   draft         GitHub has an `isDraft` boolean; GitLab has a `Draft: ` TITLE PREFIX and nothing
+#                 else. So the normalised `title` must come back WITHOUT the prefix on both arms —
+#                 otherwise every skill that reads a title has to know which forge wrote it.
+#   blockers      GitHub's `mergeStateStatus` is one coarse enum; GitLab's `detailed_merge_status`
+#                 is a finer one. Neither is a subset of the other, so the mapping is a stated
+#                 policy (skills/_shared/forge.md) rather than a lookup either side agrees with.
+#   approval      GitLab approval rules are a paid feature; the free API cannot express
+#                 "changes requested" at all.
+
+PR_EXPECT="$KIT/tests/forge/fixtures/pr.expected.json"
+[ -r "$PR_EXPECT" ] || fail "missing fixture $PR_EXPECT"
+
+cat > "$WORK/gh-pr.json" <<'JSON'
+{
+  "number": 281, "title": "add X", "body": "pr body", "state": "OPEN", "isDraft": true,
+  "headRefName": "feat/1-x", "baseRefName": "main", "headRefOid": "abc1234",
+  "url": "https://github.com/acme/widgets/pull/281",
+  "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED", "reviewDecision": "REVIEW_REQUIRED"
+}
+JSON
+
+cat > "$WORK/gl-pr.json" <<'JSON'
+{
+  "iid": 281, "title": "Draft: add X", "description": "pr body", "state": "opened",
+  "source_branch": "feat/1-x", "target_branch": "main", "sha": "abc1234",
+  "web_url": "https://gitlab.example.com/group/widgets/-/merge_requests/281",
+  "has_conflicts": false, "detailed_merge_status": "discussions_not_resolved"
+}
+JSON
+
+FIELDS_PR=number,title,state,isDraft,headRefName,baseRefName,headSha
+
+repo=$(mkrepo pr-gh "https://github.com/acme/widgets.git")
+gh_pr=$(GH_PR_FIXTURE="$WORK/gh-pr.json" bash "$FORGE" -C "$repo" pr view 281 --fields "$FIELDS_PR") \
+  || fail "pr view (github): non-zero exit"
+repo_gl=$(mkrepo pr-gl "https://gitlab.example.com/group/widgets.git")
+log="$WORK/pr-gl.log"; : > "$log"
+gl_pr=$(FORGE_STUB_LOG="$log" GLAB_FIXTURE="$WORK/gl-pr.json" \
+  bash "$FORGE" -C "$repo_gl" pr view 281 --fields "$FIELDS_PR") \
+  || fail "pr view (gitlab): non-zero exit"
+grep -q 'projects/group%2Fwidgets/merge_requests/281' "$log" \
+  || fail "pr view (gitlab): wrong endpoint — log: $(cat "$log")"
+
+for arm in gh gl; do
+  eval "got=\$${arm}_pr"
+  diff <(printf '%s\n' "$got" | jq -S .) <(jq -S . "$PR_EXPECT") >/dev/null \
+    || fail "pr view ($arm): does not match the shared expectation:
+$(diff <(printf '%s\n' "$got" | jq -S .) <(jq -S . "$PR_EXPECT") || true)"
+done
+
+# The GitLab title arrives as `Draft: add X` and comes back as `add X`. Stated separately from the
+# diff above because it is the single most load-bearing normalisation in this file: `forge pr ready`
+# works by REMOVING that prefix, so a title that still carried it would be re-prefixed on the next
+# edit and the MR would silently go back to draft.
+[ "$(printf '%s\n' "$gl_pr" | jq -r .title)" = "add X" ] \
+  || fail "pr view (gitlab): the Draft: prefix must not reach the caller"
+
+# mergeBlockers: the finer GitLab status is preserved, the coarser GitHub one is mapped, and BOTH
+# report the draft. A caller gating a merge reads this array and never the forge's own enum.
+gh_blk=$(GH_PR_FIXTURE="$WORK/gh-pr.json" bash "$FORGE" -C "$repo" pr view 281 --fields mergeBlockers)
+gl_blk=$(GLAB_FIXTURE="$WORK/gl-pr.json" bash "$FORGE" -C "$repo_gl" pr view 281 --fields mergeBlockers)
+for arm in gh gl; do
+  eval "got=\$${arm}_blk"
+  printf '%s\n' "$got" | jq -e '.mergeBlockers | index("draft")' >/dev/null \
+    || fail "pr view ($arm): mergeBlockers must contain 'draft', got '$got'"
+done
+printf '%s\n' "$gl_blk" | jq -e '.mergeBlockers | index("threads_unresolved")' >/dev/null \
+  || fail "pr view (gitlab): discussions_not_resolved must map to threads_unresolved, got '$gl_blk'"
+printf '%s\n' "$gh_blk" | jq -e '.mergeBlockers | index("not_approved")' >/dev/null \
+  || fail "pr view (github): mergeStateStatus BLOCKED must map to not_approved, got '$gh_blk'"
+
+# An UNKNOWN detailed_merge_status is carried through verbatim rather than dropped. Silently
+# discarding it would make a blocked MR look mergeable — the failure direction that costs the most.
+cat > "$WORK/gl-pr-odd.json" <<'JSON'
+{"iid": 281, "title": "add X", "state": "opened", "source_branch": "b", "target_branch": "main",
+ "sha": "abc1234", "web_url": "https://x/y", "has_conflicts": false,
+ "detailed_merge_status": "some_future_gitlab_status"}
+JSON
+out=$(GLAB_FIXTURE="$WORK/gl-pr-odd.json" bash "$FORGE" -C "$repo_gl" pr view 281 --fields mergeBlockers)
+printf '%s\n' "$out" | jq -e '.mergeBlockers | index("some_future_gitlab_status")' >/dev/null \
+  || fail "pr view (gitlab): an unmapped status must be carried through, got '$out'"
+
+# A clean MR blocks on nothing, on both arms — the empty array, not null.
+cat > "$WORK/gl-pr-clean.json" <<'JSON'
+{"iid": 281, "title": "add X", "state": "opened", "source_branch": "b", "target_branch": "main",
+ "sha": "abc1234", "web_url": "https://x/y", "has_conflicts": false,
+ "detailed_merge_status": "mergeable"}
+JSON
+out=$(GLAB_FIXTURE="$WORK/gl-pr-clean.json" bash "$FORGE" -C "$repo_gl" pr view 281 --fields mergeBlockers,mergeable)
+[ "$(printf '%s\n' "$out" | jq -c '.mergeBlockers')" = "[]" ] \
+  || fail "pr view (gitlab, clean): expected [], got '$out'"
+[ "$(printf '%s\n' "$out" | jq -r '.mergeable')" = "clean" ] \
+  || fail "pr view (gitlab, clean): expected mergeable=clean, got '$out'"
+
+# ================================================================= 12. pr checks — one shape
+
+CHECKS_EXPECT="$KIT/tests/forge/fixtures/checks.expected.json"
+[ -r "$CHECKS_EXPECT" ] || fail "missing fixture $CHECKS_EXPECT"
+
+cat > "$WORK/gh-checks.json" <<'JSON'
+{"check_runs": [
+  {"name": "kit", "status": "completed", "conclusion": "success"},
+  {"name": "title-gate", "status": "in_progress", "conclusion": null}
+]}
+JSON
+cat > "$WORK/gl-pipelines.json" <<'JSON'
+[{"id": 900, "sha": "abc1234", "status": "running"}]
+JSON
+cat > "$WORK/gl-jobs.json" <<'JSON'
+[{"name": "kit", "status": "success"}, {"name": "title-gate", "status": "running"}]
+JSON
+
+repo=$(mkrepo checks-gh "https://github.com/acme/widgets.git")
+gh_checks=$(GH_PR_FIXTURE="$WORK/gh-pr.json" GH_CHECKS_FIXTURE="$WORK/gh-checks.json" \
+  bash "$FORGE" -C "$repo" pr checks 281) || fail "pr checks (github): non-zero exit"
+log="$WORK/checks-gl.log"; : > "$log"
+gl_checks=$(FORGE_STUB_LOG="$log" GLAB_FIXTURE="$WORK/gl-pr.json" \
+  GLAB_PIPELINES_FIXTURE="$WORK/gl-pipelines.json" GLAB_JOBS_FIXTURE="$WORK/gl-jobs.json" \
+  bash "$FORGE" -C "$repo_gl" pr checks 281) || fail "pr checks (gitlab): non-zero exit"
+
+for arm in gh gl; do
+  eval "got=\$${arm}_checks"
+  diff <(printf '%s\n' "$got" | jq -S .) <(jq -S . "$CHECKS_EXPECT") >/dev/null \
+    || fail "pr checks ($arm): does not match the shared expectation:
+$(diff <(printf '%s\n' "$got" | jq -S .) <(jq -S . "$CHECKS_EXPECT") || true)"
+done
+# GitLab needs two round trips; assert BOTH happened rather than trusting the payload alone.
+grep -q 'merge_requests/281/pipelines' "$log" || fail "pr checks (gitlab): pipelines never queried"
+grep -q 'pipelines/900/jobs' "$log" || fail "pr checks (gitlab): the latest pipeline's jobs never queried"
+
+# ======================================================================= 13. pr list and pr diff
+
+cat > "$WORK/gh-prs.json" <<'JSON'
+[{"number": 281, "title": "add X", "body": "b", "state": "OPEN", "isDraft": true,
+  "headRefName": "feat/1-x", "baseRefName": "main", "headRefOid": "abc1234",
+  "url": "https://github.com/acme/widgets/pull/281", "mergeable": "MERGEABLE",
+  "mergeStateStatus": "BLOCKED", "reviewDecision": "REVIEW_REQUIRED"}]
+JSON
+repo=$(mkrepo prlist-gh "https://github.com/acme/widgets.git")
+out=$(GH_PRS_FIXTURE="$WORK/gh-prs.json" \
+  bash "$FORGE" -C "$repo" pr list --head feat/1-x --fields number,title) \
+  || fail "pr list (github): non-zero exit"
+[ "$(printf '%s\n' "$out" | jq -c '.[0]')" = '{"number":281,"title":"add X"}' ] \
+  || fail "pr list (github): got '$out'"
+
+cat > "$WORK/gl-prs.json" <<'JSON'
+[{"iid": 281, "title": "Draft: add X", "description": "b", "state": "opened",
+  "source_branch": "feat/1-x", "target_branch": "main", "sha": "abc1234",
+  "web_url": "https://x/y", "has_conflicts": false, "detailed_merge_status": "mergeable"}]
+JSON
+log="$WORK/prlist-gl.log"; : > "$log"
+out=$(FORGE_STUB_LOG="$log" GLAB_FIXTURE="$WORK/gl-prs.json" \
+  bash "$FORGE" -C "$repo_gl" pr list --head feat/1-x --fields number,title) \
+  || fail "pr list (gitlab): non-zero exit"
+[ "$(printf '%s\n' "$out" | jq -c '.[0]')" = '{"number":281,"title":"add X"}' ] \
+  || fail "pr list (gitlab): got '$out'"
+grep -q 'source_branch=feat/1-x' "$log" \
+  || fail "pr list (gitlab): --head must become source_branch — log: $(cat "$log")"
+
+cat > "$WORK/gl-changes.json" <<'JSON'
+{"changes": [{"old_path": "a.txt", "new_path": "a.txt", "diff": "@@ -1 +1 @@\n-old\n+new\n"}]}
+JSON
+out=$(GLAB_CHANGES_FIXTURE="$WORK/gl-changes.json" bash "$FORGE" -C "$repo_gl" pr diff 281) \
+  || fail "pr diff (gitlab): non-zero exit"
+# GitLab's REST `changes[].diff` starts at the first hunk, with no `diff --git`/`---`/`+++`
+# preamble. Every consumer of a diff expects those, so forge.sh synthesises them from old_path and
+# new_path rather than handing back a fragment that looks like a diff and is not one.
+printf '%s\n' "$out" | grep -q '^diff --git a/a.txt b/a.txt' \
+  || fail "pr diff (gitlab): missing the synthesised git header, got '$out'"
+printf '%s\n' "$out" | grep -q '^+new' || fail "pr diff (gitlab): the hunk was lost, got '$out'"
+
+echo "OK: forge.sh — arm resolution, kind, slug, auth, issue verbs, merge-request reads"
