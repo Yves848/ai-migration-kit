@@ -1,0 +1,9 @@
+{
+  "number": 281,
+  "title": "add X",
+  "state": "open",
+  "isDraft": true,
+  "headRefName": "feat/1-x",
+  "baseRefName": "main",
+  "headSha": "abc1234"
+}

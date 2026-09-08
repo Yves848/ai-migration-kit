@@ -81,11 +81,17 @@ esac
 REPO_FLAG=()
 PR=""
 MERGE_ARGS=()
+ARM="github"
+PROJECT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -R)        [ -n "${2:-}" ] || refuse "-R needs an <owner/repo>"
                REPO_FLAG=(-R "$2"); shift 2 ;;
+    -A)        [ -n "${2:-}" ] || refuse "-A needs an arm (github|gitlab)"
+               ARM="$2"; shift 2 ;;
+    -P)        [ -n "${2:-}" ] || refuse "-P needs a project identifier"
+               PROJECT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --)        shift; MERGE_ARGS=("$@"); break ;;
     -*)        refuse "unknown option: $1" ;;
@@ -100,11 +106,49 @@ case "$PR" in
   ''|*[!0-9]*) refuse "'$PR' is not a PR number" ;;
 esac
 
+case "$ARM" in
+  github|gitlab) ;;
+  *) refuse "-A must be 'github' or 'gitlab', got '$ARM' — this script has no third arm, and guessing one would send a merge at a forge nobody named" ;;
+esac
+# A GitLab project cannot be inferred here the way `gh` infers a GitHub repo from the checkout:
+# `glab api` addresses `projects/:id`, and :id is the URL-encoded path the CALLER resolved.
+# Guessing it would merge somebody else's merge request, so this refuses instead.
+if [ "$ARM" = "gitlab" ] && [ -z "$PROJECT" ]; then
+  refuse "-A gitlab requires -P <url-encoded project path> — there is nothing safe to infer it from"
+fi
+
 # No `--`, or `--` followed by nothing: both mean "no opinion", so both get the kit's default.
 [ "${#MERGE_ARGS[@]}" -eq 0 ] && MERGE_ARGS=(--squash --delete-branch)
 
-command -v gh > /dev/null 2>&1 || refuse "gh is missing — this script has no way to merge a PR without it"
 command -v jq > /dev/null 2>&1 || refuse "jq is missing — it is a \`required\` prerequisite in requirements.json"
+if [ "$ARM" = "github" ]; then
+  command -v gh > /dev/null 2>&1 || refuse "gh is missing — this script has no way to merge a PR without it"
+else
+  command -v glab > /dev/null 2>&1 || refuse "glab is missing — this script has no way to merge a merge request without it"
+fi
+
+# The GitLab arm's translation of the `--` args. They are documented as going to `gh pr merge`
+# verbatim, and on that arm they still do; here they are read as INTENT, because GitLab's merge is
+# one REST call with a JSON body rather than a CLI with the same flags. Only the three the kit
+# actually passes are translated — an unrecognised flag is refused rather than dropped, because a
+# silently ignored `--squash` would produce a merge commit on a repository that forbids them.
+gl_merge_payload() {
+  local squash=false remove=false subject="" a
+  while [ $# -gt 0 ]; do
+    a="$1"
+    case "$a" in
+      --squash)        squash=true; shift ;;
+      --delete-branch) remove=true; shift ;;
+      --subject)       [ -n "${2:-}" ] || refuse "--subject needs a value"
+                       subject="$2"; shift 2 ;;
+      --merge|--rebase) refuse "the GitLab arm only implements --squash; '$a' would need a policy this kit has not decided" ;;
+      *)               refuse "the GitLab arm does not know how to translate '$a'" ;;
+    esac
+  done
+  jq -n --argjson squash "$squash" --argjson remove "$remove" --arg subject "$subject" \
+    '{squash: $squash, should_remove_source_branch: $remove}
+     + (if $subject == "" then {} else {squash_commit_message: $subject} end)'
+}
 
 # ---------------------------------------------------------------- merge (exit code is a HINT,
 # not a verdict — kept only to disambiguate the OPEN case below, never trusted on its own)
@@ -120,8 +164,14 @@ command -v jq > /dev/null 2>&1 || refuse "jq is missing — it is a \`required\`
 # `2>&1 1>/dev/null` swap inside the command substitution — no temp file, so nothing to clean up
 # on an early exit either.
 set +e
-merge_err=$(gh pr merge "$PR" ${REPO_FLAG[@]+"${REPO_FLAG[@]}"} "${MERGE_ARGS[@]}" 2>&1 1>/dev/null)
-merge_rc=$?
+if [ "$ARM" = "github" ]; then
+  merge_err=$(gh pr merge "$PR" ${REPO_FLAG[@]+"${REPO_FLAG[@]}"} "${MERGE_ARGS[@]}" 2>&1 1>/dev/null)
+  merge_rc=$?
+else
+  merge_err=$(gl_merge_payload "${MERGE_ARGS[@]}" \
+    | glab api "projects/$PROJECT/merge_requests/$PR/merge" --method PUT --input - 2>&1 1>/dev/null)
+  merge_rc=$?
+fi
 set -e
 
 # ---------------------------------------------------------------- read GitHub's state back
@@ -131,9 +181,22 @@ merged_at=""
 merge_sha=""
 while [ "$attempt" -le "$READBACK_ATTEMPTS" ]; do
   set +e
-  view_json=$(gh pr view "$PR" ${REPO_FLAG[@]+"${REPO_FLAG[@]}"} \
-    --json state,mergedAt,mergeCommit --jq '[.state, (.mergedAt // ""), (.mergeCommit.oid // "")] | @tsv' 2>/dev/null)
-  view_rc=$?
+  if [ "$ARM" = "github" ]; then
+    view_json=$(gh pr view "$PR" ${REPO_FLAG[@]+"${REPO_FLAG[@]}"} \
+      --json state,mergedAt,mergeCommit --jq '[.state, (.mergedAt // ""), (.mergeCommit.oid // "")] | @tsv' 2>/dev/null)
+    view_rc=$?
+  else
+    # The SAME three fields, in the same order, normalised into the same uppercase vocabulary the
+    # decision table below already reads — so adding an arm does not add a second decision table.
+    # `opened` becomes OPEN deliberately: GitLab's word for "still open" differs from GitHub's, and
+    # anything this mapping does NOT recognise (e.g. `locked`) falls through to UNCONFIRMED rather
+    # than being coerced into a verdict.
+    view_json=$(glab api "projects/$PROJECT/merge_requests/$PR" 2>/dev/null | jq -r '
+      [ (if .state == "opened" then "OPEN" else (.state | ascii_upcase) end),
+        (.merged_at // ""),
+        (.merge_commit_sha // .squash_commit_sha // "") ] | @tsv' 2>/dev/null)
+    view_rc=$?
+  fi
   set -e
   if [ "$view_rc" -eq 0 ] && [ -n "$view_json" ]; then
     # One `jq` call above already reduced the readback to a single TSV line; `IFS=$'\t' read`

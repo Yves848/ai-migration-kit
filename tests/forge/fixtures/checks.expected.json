@@ -1,0 +1,12 @@
+[
+  {
+    "name": "kit",
+    "status": "completed",
+    "conclusion": "success"
+  },
+  {
+    "name": "title-gate",
+    "status": "in_progress",
+    "conclusion": null
+  }
+]
